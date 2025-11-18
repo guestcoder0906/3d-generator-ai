@@ -1,0 +1,5 @@
+{
+  "name": "Copy of NeuroForge 3D",
+  "description": "An autonomous, self-correcting 3D generation engine using Gemini 3.0 Pro. It features a rigid planning, generation, and visual QC pipeline to construct complex 3D scenes procedurally.",
+  "requestFramePermissions": []
+}

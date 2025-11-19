@@ -30,6 +30,18 @@ const cleanCode = (text: string): string => {
 };
 
 /**
+ * Helper to format base64 images for Gemini API
+ */
+const formatImagesForPrompt = (b64Images: string[]) => {
+  return b64Images.map(img => ({
+    inlineData: {
+      mimeType: "image/png",
+      data: img.includes('base64,') ? img.split('base64,')[1] : img
+    }
+  }));
+};
+
+/**
  * Phase 1: Planning and Decomposition
  */
 export const generateBuildPlan = async (userPrompt: string): Promise<BuildPlan> => {
@@ -84,7 +96,13 @@ export const generateBuildPlan = async (userPrompt: string): Promise<BuildPlan> 
 /**
  * Phase 2: Component Code Generation
  */
-export const generateComponentCode = async (componentName: string, description: string, previousCode?: string, errorContext?: string): Promise<string> => {
+export const generateComponentCode = async (
+  componentName: string, 
+  description: string, 
+  previousCode?: string, 
+  errorContext?: string,
+  contextImages: string[] = []
+): Promise<string> => {
   const systemInstruction = `
     You are an autonomous THREE.js Code Generator.
     Your task: Write a JavaScript function that creates a specific 3D component.
@@ -107,9 +125,16 @@ export const generateComponentCode = async (componentName: string, description: 
     prompt += `\n\nPREVIOUS ATTEMPT FAILED.\nError/Feedback: ${errorContext}\n\nPrevious Code:\n${previousCode}\n\nFIX THE CODE. Do not use export default.`;
   }
 
+  const parts: any[] = [{ text: prompt }];
+
+  if (contextImages.length > 0) {
+    parts.push({ text: "\n\nVISUAL CONTEXT: Below are images of the parts generated so far for this model. Ensure the new part maintains stylistic consistency (scale, detail level, aesthetics) with these existing parts." });
+    parts.push(...formatImagesForPrompt(contextImages));
+  }
+
   const response = await ai.models.generateContent({
     model: MODEL_LOGIC,
-    contents: prompt,
+    contents: { parts },
     config: {
       systemInstruction,
       temperature: 0.4, // Lower temperature for more stable code
@@ -123,39 +148,189 @@ export const generateComponentCode = async (componentName: string, description: 
 /**
  * Phase 2b: Visual QC Analysis
  */
-export const performVisualQC = async (componentName: string, images: string[]): Promise<QCResult> => {
-  // images are base64 strings
-  const parts = images.map(img => ({
-    inlineData: {
-      mimeType: "image/png",
-      data: img.split(',')[1] // remove data:image/png;base64, prefix
-    }
-  }));
+export const performVisualQC = async (
+  componentName: string, 
+  images: string[],
+  contextImages: string[] = []
+): Promise<QCResult> => {
+  const parts = formatImagesForPrompt(images);
 
-  const prompt = `
+  let prompt = `
     You are a Visual Quality Control Agent for a 3D pipeline.
     Subject: "${componentName}"
     
     Analyze these 6 viewpoints (Front, Back, Top, Bottom, Left, Right).
     
     CRITICAL INSTRUCTIONS:
-    1. IGNORE SHADOWS: The rendering environment uses directional lighting. Dark areas, black shadows, or gradients (especially on the Bottom or shaded sides) are EXPECTED and NORMAL. DO NOT flag them as errors.
-    2. FOCUS ON GEOMETRY: Only fail the model if there are clear GEOMETRIC defects (e.g., fragmented mesh, exploded vertices, missing faces where you can see through the object, or totally unrecognizable shapes).
+    1. IGNORE SHADOWS: The rendering environment uses directional lighting. Dark areas, black shadows, or gradients are EXPECTED.
+    2. FOCUS ON GEOMETRY: Only fail the model if there are clear GEOMETRIC defects (e.g., fragmented mesh, exploded vertices, missing faces).
     3. IGNORE COLOR/LIGHTING: Do not judge the lighting quality.
     
     Check for:
     1. Structural integrity (Is it a solid, coherent object?)
-    2. Visual artifacts (Severe Z-fighting, reversed normals causing transparency).
+    2. Visual artifacts (Severe Z-fighting, reversed normals).
     3. Relevance (Does it look like a ${componentName}?)
-    
-    Return JSON.
   `;
+
+  if (contextImages.length > 0) {
+    prompt += `\n\n4. CONSISTENCY: Compare with the 'CONTEXT IMAGES' provided. Does this part fit the style and scale of the rest of the model?`;
+  }
+    
+  prompt += `\nReturn JSON.`;
 
   const schema: Schema = {
     type: Type.OBJECT,
     properties: {
       passed: { type: Type.BOOLEAN },
       feedback: { type: Type.STRING, description: "Specific instructions on what to fix if failed, or praise if passed." },
+      score: { type: Type.INTEGER }
+    },
+    required: ["passed", "feedback", "score"]
+  };
+
+  const contentParts: any[] = [...parts, { text: prompt }];
+
+  if (contextImages.length > 0) {
+    contentParts.push({ text: "CONTEXT IMAGES (Previously verified parts):" });
+    contentParts.push(...formatImagesForPrompt(contextImages));
+  }
+
+  const response = await ai.models.generateContent({
+    model: MODEL_VISION,
+    contents: {
+      parts: contentParts
+    },
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: schema
+    }
+  });
+
+  if (!response.text) throw new Error("QC failed to respond");
+  return JSON.parse(response.text) as QCResult;
+};
+
+/**
+ * Phase 3a: Step-by-Step Attachment Code Generation
+ * Replaces the old "Assembly Code" with an iterative attachment approach.
+ */
+export const generateAttachmentCode = async (
+  overview: string,
+  partName: string,
+  partDescription: string,
+  currentAssemblyImages: string[],
+  previousCode?: string, 
+  errorContext?: string
+): Promise<string> => {
+   const systemInstruction = `
+    You are an expert 3D Assembly Engineer specializing in THREE.js.
+    
+    TASK: Write a JavaScript function 'attach(root, part)' to attach a NEW PART to an EXISTING ASSEMBLY.
+    
+    CONTEXT:
+    - 'root' (THREE.Object3D): The main assembly so far.
+    - 'part' (THREE.Object3D): The new component to be added (currently at 0,0,0).
+    - The 'root' is already assembled. Do NOT move the root.
+    - You must MOVE, ROTATE, and SCALE the 'part' to fit onto the 'root' correctly.
+    
+    INSTRUCTIONS:
+    1. **Analyze Bounding Boxes**:
+       - Use 'new THREE.Box3().setFromObject(root)' to find the dimensions of the assembly.
+       - Use 'new THREE.Box3().setFromObject(part)' to find the dimensions of the new part.
+       
+    2. **Rescaling**:
+       - Compare the dimensions. Rescale 'part' to a logical size relative to 'root'.
+       - Example: If 'part' is a Door, it should fit within the height of the 'root' (House).
+       - Apply 'part.scale.setScalar(ratio)'.
+
+    3. **Positioning & Orientation**:
+       - Move 'part' to the correct location on 'root' (e.g., wheels go to the bottom corners).
+       - Rotate 'part' if needed (e.g., wheels need to face outward).
+    
+    4. **Duplication**:
+       - If the part name implies multiple instances (e.g., "Wheels", "Headlights", "Propellers") but 'part' is a single object:
+         - CLONE 'part' for each instance needed.
+         - Position each clone correctly.
+         - Add ALL clones to 'root'.
+         - If it's a single item (e.g., "Turret"), just add 'part' to 'root'.
+    
+    5. **Final Step**:
+       - Ensure 'part' (or its clones) is added to 'root' via 'root.add(part)'.
+    
+    RETURN:
+    - Only the 'attach' function code.
+    - No imports/exports.
+  `;
+
+  let prompt = `
+    Assembly Plan: ${overview}
+    Task: Attach "${partName}" (${partDescription}) to the current model.
+    
+    Write the 'attach' function.
+  `;
+
+  if (previousCode && errorContext) {
+    prompt += `\n\nPREVIOUS ATTEMPT FAILED.\nFeedback: ${errorContext}\n\nPrevious Code:\n${previousCode}\n\nFIX THE CODE. \n- Adjust coordinates, scale, or rotation based on the visual feedback.`;
+  }
+
+  const parts: any[] = [
+    { text: "CURRENT ASSEMBLY STATE (Visual Context):" },
+    ...formatImagesForPrompt(currentAssemblyImages),
+    { text: prompt }
+  ];
+
+  const response = await ai.models.generateContent({
+    model: MODEL_LOGIC,
+    contents: { parts },
+    config: {
+      systemInstruction,
+      thinkingConfig: { thinkingBudget: 2048 },
+      temperature: 0.2 
+    }
+  });
+
+  const text = response.text || "";
+  return cleanCode(text);
+};
+
+/**
+ * Phase 3b: Assembly Visual QC (Targeted)
+ */
+export const performAssemblyQC = async (
+  planOverview: string, 
+  currentPartName: string,
+  images: string[]
+): Promise<QCResult> => {
+  const parts = formatImagesForPrompt(images);
+
+  const prompt = `
+    You are a Visual QA Agent for a 3D Scene Assembler.
+    The scene represents: "${planOverview}".
+    
+    ACTION PERFORMED: Added component "${currentPartName}".
+    
+    Analyze the 6 viewpoints provided.
+    
+    Task: Verify that "${currentPartName}" is correctly attached to the model.
+    
+    Pass criteria:
+    1. "${currentPartName}" is physically connected to the main body (not floating miles away).
+    2. "${currentPartName}" is scaled appropriately (not microscopic, not 100x too big).
+    3. "${currentPartName}" is oriented correctly (e.g. wheels touch ground, turret on top).
+    
+    Fail criteria:
+    1. The new part is floating in void.
+    2. The new part is clipping completely inside another part (invisible).
+    3. The new part is drastically incorrectly scaled.
+    
+    Return JSON.
+  `;
+  
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      passed: { type: Type.BOOLEAN },
+      feedback: { type: Type.STRING, description: "Specific feedback on how to fix the specific part (e.g. 'Move wheel down 2 units', 'Scale turret up 2x')." },
       score: { type: Type.INTEGER }
     },
     required: ["passed", "feedback", "score"]
@@ -172,61 +347,6 @@ export const performVisualQC = async (componentName: string, images: string[]): 
     }
   });
 
-  if (!response.text) throw new Error("QC failed to respond");
+  if (!response.text) throw new Error("Assembly QC failed to respond");
   return JSON.parse(response.text) as QCResult;
-};
-
-/**
- * Phase 3: Assembly Code Generation
- */
-export const generateAssemblyCode = async (plan: BuildPlan, previousCode?: string, errorContext?: string): Promise<string> => {
-   const systemInstruction = `
-    You are an expert 3D Assembly Engineer specializing in THREE.js procedural generation.
-    
-    Goal: Write a function 'assemble(components)' that combines disparate 3D parts into a coherent object defined by: "${plan.overview}".
-    
-    INPUT:
-    - 'components': A dictionary where keys are Component IDs and values are THREE.Object3D instances.
-    
-    CRITICAL CHALLENGE:
-    - The components were generated in isolation. They have RANDOM SCALES and POSITIONS.
-    - You CANNOT assume a "Wheel" is the right size for a "Car Body".
-    - You MUST programmatically measure them using 'new THREE.Box3().setFromObject(part)' to get their dimensions.
-    
-    REQUIREMENTS:
-    1. Return a single root THREE.Group containing all parts.
-    2. Clone each component from the input dictionary using .clone().
-    3. RESIZE & ALIGN:
-       - Identify a "Core" component (e.g., Chassis, Body, Main Hub) to act as the anchor.
-       - Calculate bounding boxes for all parts.
-       - Apply .scale.set(x,y,z) to ancillary parts (wheels, rotors, turrets) so they are proportionally correct relative to the Core.
-       - Apply .position.set(x,y,z) to place them correctly (e.g., wheels at the corners of the chassis bounding box).
-       - Apply .rotation.set(x,y,z) if needed (e.g., rotate wheels 90 degrees if they are facing wrong).
-    4. Use standard THREE.js math (Vector3, Box3).
-    5. If multiple instances are needed (e.g., 4 wheels), clone the source component multiple times.
-    
-    CONSTRAINTS:
-    - Function name MUST be 'assemble'.
-    - NO import/export/require.
-    - ONLY return the JavaScript code block.
-  `;
-
-  const componentList = plan.components.map(c => `ID: ${c.id} | Name: ${c.name} | Desc: ${c.description}`).join('\n');
-  let prompt = `Generate the 'assemble' function for these components:\n${componentList}\n\nEnsure all parts are scaled and positioned logically relative to each other.`;
-
-  if (previousCode && errorContext) {
-    prompt += `\n\nPREVIOUS ASSEMBLY ATTEMPT FAILED.\nError: ${errorContext}\n\nPrevious Code:\n${previousCode}\n\nFIX THE ASSEMBLY CODE. Ensure valid JavaScript. Did you calculate bounding boxes?`;
-  }
-
-  const response = await ai.models.generateContent({
-    model: MODEL_LOGIC,
-    contents: prompt,
-    config: {
-      systemInstruction,
-      thinkingConfig: { thinkingBudget: 4096 } // Enable thinking for spatial reasoning in assembly
-    }
-  });
-
-  const text = response.text || "";
-  return cleanCode(text);
 };

@@ -1,8 +1,8 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import * as THREE from 'three';
-import { AppPhase, BuildPlan, ComponentArtifact, LogEntry } from './types';
+import { AppPhase, BuildPlan, ComponentArtifact, LogEntry, ComponentPlan } from './types';
 import ThreeStage, { ThreeStageHandle } from './components/ThreeStage';
-import { generateBuildPlan, generateComponentCode, performVisualQC, generateAssemblyCode } from './services/geminiService';
+import { generateBuildPlan, generateComponentCode, performVisualQC, generateAttachmentCode, performAssemblyQC } from './services/geminiService';
 
 // Exporter Imports
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter';
@@ -52,41 +52,61 @@ export default function App() {
   const executeGeneratedCode = (code: string): THREE.Object3D => {
     try {
       const safeCode = sanitizeCode(code);
-      // Safe-ish eval using Function constructor. 
-      // We inject THREE and expect a function 'createPart' or an IIFE returning the object.
-      // We wrap the code to ensure it returns the result of createPart(THREE).
-      
       const wrappedCode = `
         ${safeCode}
         return createPart(THREE);
       `;
-      
       const generatorFunc = new Function('THREE', wrappedCode);
       const result = generatorFunc(THREE);
-      
       if (!(result instanceof THREE.Object3D)) {
         throw new Error("Generated code did not return a valid THREE.Object3D instance.");
       }
       return result;
-
     } catch (e: any) {
       throw new Error(`Execution Error: ${e.message}. Stack: ${e.stack}`);
     }
   };
 
-  const executeAssemblyCode = (code: string, parts: Record<string, THREE.Object3D>): THREE.Object3D => {
-     try {
+  const executeAttachmentCode = (code: string, root: THREE.Object3D, part: THREE.Object3D): void => {
+    try {
       const safeCode = sanitizeCode(code);
       const wrappedCode = `
         ${safeCode}
-        return assemble(parts);
+        return attach(root, part);
       `;
-      const assemblerFunc = new Function('parts', 'THREE', wrappedCode);
-      const result = assemblerFunc(parts, THREE);
-      return result;
+      const attacherFunc = new Function('root', 'part', 'THREE', wrappedCode);
+      attacherFunc(root, part, THREE);
     } catch (e: any) {
-      throw new Error(`Assembly Execution Error: ${e.message}. Stack: ${e.stack}`);
+      throw new Error(`Attachment Execution Error: ${e.message}`);
     }
+  };
+
+  // --- Topological Sort for Assembly Order ---
+  const sortComponentsTopologically = (components: ComponentPlan[]): ComponentPlan[] => {
+    const visited = new Set<string>();
+    const sorted: ComponentPlan[] = [];
+    const tempVisited = new Set<string>(); // For cycle detection
+
+    const visit = (nodeId: string) => {
+      if (visited.has(nodeId)) return;
+      if (tempVisited.has(nodeId)) return; // Cycle detected, skip
+
+      tempVisited.add(nodeId);
+      
+      const node = components.find(c => c.id === nodeId);
+      if (node) {
+        // Visit dependencies first
+        if (node.dependencies) {
+          node.dependencies.forEach(depId => visit(depId));
+        }
+        visited.add(nodeId);
+        sorted.push(node);
+      }
+    };
+
+    // Start visiting all nodes. If dependencies are missing, it just adds them.
+    components.forEach(c => visit(c.id));
+    return sorted;
   };
 
   // --- Core Pipeline ---
@@ -119,52 +139,154 @@ export default function App() {
         };
       });
       setComponents(initialComponents);
+      
+      // Local mutable copy of components to prevent stale closure issues in async loop
+      const pipelineComponents = { ...initialComponents };
 
-      // 2. Component Loop
+      // Store images of verified parts to pass as context to subsequent parts
+      const collectedContextImages: string[] = [];
+
+      // 2. Component Generation Loop
       for (const component of plan.components) {
-        await processComponent(component.id, initialComponents[component.id], initialComponents);
+        const processedArtifact = await processComponent(
+          component.id, 
+          pipelineComponents[component.id], 
+          collectedContextImages
+        );
+        // Update local tracker
+        pipelineComponents[component.id] = processedArtifact;
       }
 
-      // 3. Assembly Loop (Robust Self-Correction)
+      // 3. Step-by-Step Assembly Loop
       setPhase(AppPhase.ASSEMBLING);
-      addLog("All components verified. Assembling final model...", 'info');
+      addLog("Starting Step-by-Step Assembly...", 'info');
       
-      let assemblyCode = '';
-      let assemblySuccess = false;
-      let assemblyRetries = 0;
-      let assemblyErrorContext = '';
+      // Determine logical order (Dependencies first)
+      const sortedComponents = sortComponentsTopologically(plan.components);
+      
+      // The first component is treated as the "Root" or "Core"
+      const rootComp = sortedComponents[0];
+      if (!rootComp) throw new Error("No components to assemble");
 
-      while (!assemblySuccess && assemblyRetries < 4) {
-        try {
-          // Reset scene for clean assembly
-          threeStageRef.current?.resetScene();
+      addLog(`Setting Anchor Component: ${rootComp.name}`, 'info');
+      
+      // Initialize Assembly State with Root
+      const rootObject = validatedObjectsRef.current[rootComp.id].clone();
+      // Center the root explicitly
+      const box = new THREE.Box3().setFromObject(rootObject);
+      const center = new THREE.Vector3();
+      box.getCenter(center);
+      rootObject.position.sub(center);
 
-          if (assemblyRetries > 0) {
-            addLog(`Fixing Assembly Logic (Attempt ${assemblyRetries + 1})...`, 'warning');
-          }
+      // Setup Scene with Root
+      threeStageRef.current?.resetScene();
+      threeStageRef.current?.addObject(rootObject);
+      
+      // Capture initial state
+      await new Promise(r => setTimeout(r, 400));
+      let currentAssemblySnapshots = await threeStageRef.current?.captureSnapshots() || [];
 
-          // Generate or Fix Assembly Code
-          assemblyCode = await generateAssemblyCode(plan, assemblyCode, assemblyErrorContext);
-          
-          // Execute Assembly
-          const finalModel = executeAssemblyCode(assemblyCode, validatedObjectsRef.current);
-          
-          // If successful
-          threeStageRef.current?.addObject(finalModel);
-          assemblySuccess = true;
-          addLog("Assembly complete. Model ready.", 'success');
-          setPhase(AppPhase.COMPLETED);
+      // Iterate through remaining components and attach them one by one
+      const componentsToAttach = sortedComponents.slice(1);
 
-        } catch (e: any) {
-          assemblyRetries++;
-          assemblyErrorContext = `Error: ${e.message}\nStack: ${e.stack}`;
-          addLog(`Assembly Failed: ${e.message}`, 'error');
-          
-          if (assemblyRetries >= 4) {
-            throw new Error(`Assembly failed after max retries. Last error: ${e.message}`);
+      for (const partComp of componentsToAttach) {
+        setCurrentProcessingId(partComp.id);
+        
+        // Use pipelineComponents instead of state 'components' to get fresh data
+        const partArtifact = pipelineComponents[partComp.id];
+        
+        if (!partArtifact) {
+            addLog(`Skipping ${partComp.name} (Data not found)`, 'error');
+            continue;
+        }
+        
+        if (partArtifact.status !== 'VERIFIED') {
+          addLog(`Skipping ${partComp.name} (Not Verified)`, 'warning');
+          continue;
+        }
+
+        addLog(`Attaching: ${partComp.name}...`, 'info');
+        
+        let attached = false;
+        let retries = 0;
+        let errorContext = "";
+        
+        while (!attached && retries < 4) {
+          try {
+            // 1. Generate Attachment Code
+            // We show the AI the current assembly state + the new part to add
+            const code = await generateAttachmentCode(
+              plan.overview,
+              partComp.name,
+              partComp.description,
+              currentAssemblySnapshots,
+              undefined, // We don't pass old code here to force fresh thinking, but we pass error context
+              errorContext
+            );
+
+            // 2. Execute Attachment (on a test clone first to avoid corrupting main state)
+            const testRoot = rootObject.clone(); 
+            const partObj = validatedObjectsRef.current[partComp.id].clone();
+            
+            // Reset Scene to Test State
+            threeStageRef.current?.resetScene();
+            threeStageRef.current?.addObject(testRoot);
+            
+            // Run logic (mutates testRoot by adding partObj)
+            executeAttachmentCode(code, testRoot, partObj);
+            
+            // 3. Visual QC on this specific step
+            await new Promise(r => setTimeout(r, 400));
+            const testSnapshots = await threeStageRef.current?.captureSnapshots() || [];
+            
+            const qcResult = await performAssemblyQC(plan.overview, partComp.name, testSnapshots);
+            
+            if (qcResult.passed) {
+              addLog(`${partComp.name} Attached Successfully.`, 'success');
+              
+              // Commit changes
+              rootObject.copy(testRoot, true); // Copy structure
+              // Note: recursive copy might be tricky with ThreeJS, safer to just swap the reference for the next loop if we were tracking it differently.
+              // Since we are clearing scene and adding back, let's just update our local reference logic.
+              // Actually, the easiest way is to just clear rootObject's children and copy testRoot's children, 
+              // OR just set rootObject = testRoot for the next iteration.
+              // However, rootObject is a const reference. Let's use structure mutation.
+              
+              // Better approach: The Scene is the truth.
+              // We validated testRoot. Let's make it the new source of truth.
+              // But we need to keep 'rootObject' variable updated for the next loop iteration clone.
+              rootObject.children = [...testRoot.children]; // Transfer ownership of children (including the new part)
+              rootObject.position.copy(testRoot.position);
+              rootObject.rotation.copy(testRoot.rotation);
+              rootObject.scale.copy(testRoot.scale);
+              
+              // Update snapshots for next context
+              currentAssemblySnapshots = testSnapshots;
+              attached = true;
+            } else {
+              addLog(`Attachment QC Failed for ${partComp.name}: ${qcResult.feedback}`, 'warning');
+              errorContext = qcResult.feedback;
+              retries++;
+            }
+
+          } catch (e: any) {
+            addLog(`Attachment Runtime Error: ${e.message}`, 'error');
+            errorContext = e.message;
+            retries++;
           }
         }
+
+        if (!attached) {
+          addLog(`Failed to attach ${partComp.name} after retries. Skipping.`, 'error');
+          // Restore scene to last known good state
+          threeStageRef.current?.resetScene();
+          threeStageRef.current?.addObject(rootObject);
+        }
       }
+
+      addLog("Assembly Completed.", 'success');
+      setPhase(AppPhase.COMPLETED);
+      setCurrentProcessingId(null);
 
     } catch (e: any) {
       addLog(`Critical Failure: ${e.message}`, 'error');
@@ -172,7 +294,11 @@ export default function App() {
     }
   };
 
-  const processComponent = async (id: string, artifact: ComponentArtifact, allArtifacts: Record<string, ComponentArtifact>) => {
+  const processComponent = async (
+    id: string, 
+    artifact: ComponentArtifact, 
+    contextImages: string[]
+  ): Promise<ComponentArtifact> => {
     setCurrentProcessingId(id);
     let currentArtifact: ComponentArtifact = { ...artifact };
     let verified = false;
@@ -192,13 +318,12 @@ export default function App() {
             currentArtifact.plan.name, 
             currentArtifact.plan.description,
             currentArtifact.code,
-            errorContext
+            errorContext,
+            contextImages
           );
           
           currentArtifact.code = code;
           currentArtifact.status = 'GENERATED';
-          
-          // Update UI state immediately
           setComponents(prev => ({ ...prev, [id]: currentArtifact }));
         }
 
@@ -210,19 +335,21 @@ export default function App() {
         // C. Visual QC
         setPhase(AppPhase.QC_ANALYSIS);
         addLog(`Performing Visual QC on ${currentArtifact.plan.name}...`, 'info');
-        
-        // Wait a tick for render
         await new Promise(r => setTimeout(r, 200));
         const snapshots = await threeStageRef.current?.captureSnapshots() || [];
         
-        const qcResult = await performVisualQC(currentArtifact.plan.name, snapshots);
+        const qcResult = await performVisualQC(currentArtifact.plan.name, snapshots, contextImages);
         currentArtifact.qcHistory.unshift(qcResult);
 
         if (qcResult.passed) {
           addLog(`QC PASSED: ${currentArtifact.plan.name}. Score: ${qcResult.score}`, 'success');
           currentArtifact.status = 'VERIFIED';
           verified = true;
-          validatedObjectsRef.current[id] = object3d; // Store for assembly
+          validatedObjectsRef.current[id] = object3d; 
+          
+          if (snapshots.length > 0) {
+             contextImages.push(snapshots[0]);
+          }
         } else {
           addLog(`QC FAILED: ${currentArtifact.plan.name}. Feedback: ${qcResult.feedback}`, 'warning');
           currentArtifact.status = 'FAILED';
@@ -230,21 +357,21 @@ export default function App() {
         }
 
       } catch (e: any) {
-        // Capture full error context including stack trace
-        const errorMsg = `Error: ${e.message}\nStack: ${e.stack}`;
-        addLog(`Runtime Error in ${currentArtifact.plan.name}: ${e.message}`, 'error');
+        const errorMsg = `Error: ${e.message}`;
+        addLog(errorMsg, 'error');
         currentArtifact.errorLogs.push(errorMsg); 
         currentArtifact.status = 'FAILED';
         currentArtifact.retryCount++;
       }
       
-      // Update Global State
       setComponents(prev => ({ ...prev, [id]: currentArtifact }));
     }
 
     if (!verified) {
       throw new Error(`Failed to generate stable component ${currentArtifact.plan.name} after maximum retries.`);
     }
+    
+    return currentArtifact;
   };
 
   // --- Export Logic ---

@@ -95,7 +95,7 @@ export const generateComponentCode = async (componentName: string, description: 
     - It MUST return a THREE.Object3D (Mesh or Group).
     - DO NOT create scene, camera, renderer, or lights. These are pre-configured.
     - Use high-fidelity PBR materials (MeshStandardMaterial/MeshPhysicalMaterial).
-    - Ensure geometry is centered at (0,0,0) locally unless specified.
+    - Ensure geometry is centered at (0,0,0) locally.
     - Scaling should be roughly appropriate for a unit scale of 1 unit = 1 meter.
     - NO 'export', 'import' or 'require' statements. This code runs inside a Function constructor.
     - ONLY return the JavaScript code block.
@@ -181,31 +181,41 @@ export const performVisualQC = async (componentName: string, images: string[]): 
  */
 export const generateAssemblyCode = async (plan: BuildPlan, previousCode?: string, errorContext?: string): Promise<string> => {
    const systemInstruction = `
-    You are the Assembly Engineer.
-    You have a set of existing functions named by their component IDs (e.g. 'chassis', 'wheels').
+    You are an expert 3D Assembly Engineer specializing in THREE.js procedural generation.
     
-    Your task: Write a function 'assemble' that takes a 'components' dictionary as input.
-    'components' is an object where keys are component IDs and values are THREE.Object3D instances.
+    Goal: Write a function 'assemble(components)' that combines disparate 3D parts into a coherent object defined by: "${plan.overview}".
     
-    The function should:
-    1. Create a root THREE.Group.
-    2. Clone the components from the dictionary.
-    3. Position, Rotate, and Scale them to form the final object based on the Plan Overview: "${plan.overview}".
-    4. Add them to the root group.
-    5. Return the root group.
+    INPUT:
+    - 'components': A dictionary where keys are Component IDs and values are THREE.Object3D instances.
+    
+    CRITICAL CHALLENGE:
+    - The components were generated in isolation. They have RANDOM SCALES and POSITIONS.
+    - You CANNOT assume a "Wheel" is the right size for a "Car Body".
+    - You MUST programmatically measure them using 'new THREE.Box3().setFromObject(part)' to get their dimensions.
+    
+    REQUIREMENTS:
+    1. Return a single root THREE.Group containing all parts.
+    2. Clone each component from the input dictionary using .clone().
+    3. RESIZE & ALIGN:
+       - Identify a "Core" component (e.g., Chassis, Body, Main Hub) to act as the anchor.
+       - Calculate bounding boxes for all parts.
+       - Apply .scale.set(x,y,z) to ancillary parts (wheels, rotors, turrets) so they are proportionally correct relative to the Core.
+       - Apply .position.set(x,y,z) to place them correctly (e.g., wheels at the corners of the chassis bounding box).
+       - Apply .rotation.set(x,y,z) if needed (e.g., rotate wheels 90 degrees if they are facing wrong).
+    4. Use standard THREE.js math (Vector3, Box3).
+    5. If multiple instances are needed (e.g., 4 wheels), clone the source component multiple times.
     
     CONSTRAINTS:
-    - NO 'export', 'import' or 'require'.
-    - The function MUST be named 'assemble'.
-    - Do not assume components have specific geometry properties (like .geometry.parameters), rely on bounding boxes if needed.
-    - ONLY return the code block.
+    - Function name MUST be 'assemble'.
+    - NO import/export/require.
+    - ONLY return the JavaScript code block.
   `;
 
-  const componentList = plan.components.map(c => `${c.id} (${c.name}): ${c.description}`).join('\n');
-  let prompt = `Generate assembly logic for these components:\n${componentList}`;
+  const componentList = plan.components.map(c => `ID: ${c.id} | Name: ${c.name} | Desc: ${c.description}`).join('\n');
+  let prompt = `Generate the 'assemble' function for these components:\n${componentList}\n\nEnsure all parts are scaled and positioned logically relative to each other.`;
 
   if (previousCode && errorContext) {
-    prompt += `\n\nPREVIOUS ASSEMBLY ATTEMPT FAILED.\nError: ${errorContext}\n\nPrevious Code:\n${previousCode}\n\nFIX THE ASSEMBLY CODE. Ensure valid JavaScript.`;
+    prompt += `\n\nPREVIOUS ASSEMBLY ATTEMPT FAILED.\nError: ${errorContext}\n\nPrevious Code:\n${previousCode}\n\nFIX THE ASSEMBLY CODE. Ensure valid JavaScript. Did you calculate bounding boxes?`;
   }
 
   const response = await ai.models.generateContent({
@@ -213,6 +223,7 @@ export const generateAssemblyCode = async (plan: BuildPlan, previousCode?: strin
     contents: prompt,
     config: {
       systemInstruction,
+      thinkingConfig: { thinkingBudget: 4096 } // Enable thinking for spatial reasoning in assembly
     }
   });
 
